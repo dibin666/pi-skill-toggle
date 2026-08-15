@@ -1,5 +1,5 @@
 {
-  "name": "pi-skill-toggle",
+  "name": "@dibin946/pi-skill-toggle",
   "version": "1.0.2",
   "description": "Enable/disable skills from loading into pi context at startup",
   "main": "index.ts",
@@ -15,12 +15,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Whamp/pi-skill-toggle.git"
+    "url": "git+https://github.com/dibin666/pi-skill-toggle.git"
   },
   "bugs": {
-    "url": "https://github.com/Whamp/pi-skill-toggle/issues"
+    "url": "https://github.com/dibin666/pi-skill-toggle/issues"
   },
-  "homepage": "https://github.com/Whamp/pi-skill-toggle#readme",
+  "homepage": "https://github.com/dibin666/pi-skill-toggle#readme",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"

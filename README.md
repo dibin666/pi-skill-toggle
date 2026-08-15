@@ -7,13 +7,13 @@ Full credit to [nicobailon](https://github.com/nicobailon) for pi-skill-palette 
 ## Install
 
 ```bash
-pi install npm:pi-skill-toggle
+pi install npm:@dibin946/pi-skill-toggle
 ```
 
 Or from git:
 
 ```bash
-pi install git:github.com/Whamp/pi-skill-toggle
+pi install git:github.com/dibin666/pi-skill-toggle
 ```
 
 Restart pi to load the extension. For a local checkout, run:
