@@ -16,13 +16,21 @@ Or from git:
 pi install git:github.com/Whamp/pi-skill-toggle
 ```
 
-Restart pi to load the extension.
+Restart pi to load the extension. For a local checkout, run:
+
+```bash
+pi -e ./index.ts
+```
+
+The current implementation targets Pi's `@earendil-works` API (Pi 0.84+).
 
 ## Usage
 
-```
+```text
 /skills-toggle
 ```
+
+`/skills` is also available as a short alias.
 
 This opens an interactive overlay where you can:
 - **Navigate** with ↑/↓ arrows
@@ -34,7 +42,9 @@ This opens an interactive overlay where you can:
 
 ## How It Works
 
-Skills are disabled by adding `-path` entries to the `skills` array in `~/.pi/agent/settings.json`. For example:
+The extension asks Pi's own `DefaultPackageManager` to resolve the complete skill catalog, including global/project settings, `.agents/skills`, local paths, packages, and currently loaded extension skills. It writes through Pi's `SettingsManager`, so global and project settings stay separate and writes use Pi's settings locking.
+
+For ordinary local skills, disabled entries use Pi's built-in `-path` resource filter. For example:
 
 ```json
 {
@@ -45,12 +55,12 @@ Skills are disabled by adding `-path` entries to the `skills` array in `~/.pi/ag
 }
 ```
 
-This uses pi's built-in resource filtering mechanism. Disabled skills:
-- Won't appear in your system prompt
-- Won't load their frontmatter into context
-- Are still visible in the `/skills-toggle` UI (shown as disabled)
+Package skills are filtered in the package's `skills` selection when necessary. Missing packages are never installed just by opening the toggle UI.
 
-**Changes require a restart** (or `/reload`) to take effect.
+Disabled skills:
+- Won't appear in the system prompt
+- Won't load their frontmatter into context
+- Are still visible in the toggle UI
 
 ## Disable Modes
 
@@ -102,16 +112,16 @@ Create `theme.json` in the extension directory to customize colors. Copy `theme.
 
 Values are ANSI SGR codes (e.g., `"36"` for cyan, `"2;3"` for dim+italic).
 
-## Skill Locations Scanned
+## Skill locations
 
-The extension discovers skills from:
-1. `~/.codex/skills/` (recursive)
-2. `~/.claude/skills/` (one level deep)
-3. `.claude/skills/` (project, one level deep)
-4. `~/.pi/agent/skills/` (recursive)
-5. `~/.pi/skills/` (recursive)
-6. `.pi/skills/` (project, recursive)
-7. `~/.agents/skills/` (recursive)
+The extension uses Pi's current resource resolver rather than a hard-coded list. It follows the same precedence and filtering as Pi itself, including:
+
+- global and project `.pi/skills/`
+- global and ancestor `.agents/skills/`
+- skills configured in settings or Pi packages
+- skills contributed by loaded extensions
+
+This keeps the toggle list aligned with the Pi version in use.
 
 ## License
 

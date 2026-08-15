@@ -2,43 +2,73 @@
  * pi-skill-toggle
  *
  * Extension to enable/disable skills from loading into pi context.
- * Usage: /skills - Opens the skill toggle UI
+ * Usage: /skills-toggle (or /skills) - Opens the skill toggle UI.
  *
- * Disabled skills are persisted via settings.json using the -path pattern.
- * Changes take effect on next pi restart (or /reload).
- *
- * Matches pi's deduplication behavior: first skill with a given name wins.
- * When a skill has duplicates (same name, different paths), disabling it
- * disables ALL paths to ensure the skill is fully disabled.
- *
- * Inspired by pi-skill-palette.
+ * Disabled skills are persisted through Pi's resource filtering settings.
+ * Hidden skills remain available to /skill:name but are omitted from the
+ * model's automatically available skill list.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import {
+  CONFIG_DIR_NAME,
+  DefaultPackageManager,
+  getAgentDir,
+  parseFrontmatter,
+  SettingsManager,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type PackageSource,
+  type ResolvedResource,
+  type Skill,
+} from "@earendil-works/pi-coding-agent";
+import { decodeKittyPrintable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
 type DisableMode = "enabled" | "hidden" | "disabled";
+type SettingsScope = "global" | "project";
+type ResourceMetadata = ResolvedResource["metadata"];
+type PiSettings = ReturnType<SettingsManager["getGlobalSettings"]>;
+
+interface ParsedSkill {
+  name: string;
+  description: string;
+  disableModelInvocation: boolean;
+}
+
+interface SkillResource {
+  filePath: string;
+  enabled: boolean;
+  metadata: ResourceMetadata;
+  parsed: ParsedSkill;
+}
 
 interface SkillInfo {
-	name: string;
-	description: string;
-	filePath: string;        // Primary path (first found, shown to user)
-	allPaths: string[];      // All paths with this name (for disabling all)
-	mode: DisableMode;
-	disableModelInvocation: boolean;  // True if frontmatter has disable-model-invocation: true
-	hasDuplicates: boolean;  // True if multiple paths share this name
+  name: string;
+  description: string;
+  filePath: string; // Primary path (the active winner when available)
+  allPaths: string[]; // All paths with this name (for disabling all)
+  resources: SkillResource[];
+  mode: DisableMode;
+  disableModelInvocation: boolean;
+  hasDuplicates: boolean;
+}
+
+interface SkillCatalog {
+  skills: SkillInfo[];
+  byName: Map<string, SkillInfo>;
+  settingsManager: SettingsManager;
 }
 
 interface SkillToggleResult {
-	action: "toggle" | "cancel" | "apply";
-	changes: Map<string, DisableMode>; // skill name -> new mode
+  action: "toggle" | "cancel" | "apply";
+  changes: Map<string, DisableMode>; // skill name -> new mode
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -46,591 +76,554 @@ interface SkillToggleResult {
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface ToggleTheme {
-	border: string;
-	title: string;
-	enabled: string;
-	hidden: string;
-	disabled: string;
-	selected: string;
-	selectedText: string;
-	searchIcon: string;
-	placeholder: string;
-	description: string;
-	hint: string;
-	changed: string;
-	duplicate: string;
+  border: string;
+  title: string;
+  enabled: string;
+  hidden: string;
+  disabled: string;
+  selected: string;
+  selectedText: string;
+  searchIcon: string;
+  placeholder: string;
+  description: string;
+  hint: string;
+  changed: string;
+  duplicate: string;
 }
 
 const DEFAULT_THEME: ToggleTheme = {
-	border: "2",           // dim
-	title: "2",            // dim
-	enabled: "32",         // green
-	hidden: "33",          // yellow
-	disabled: "31",        // red
-	selected: "36",        // cyan
-	selectedText: "36",    // cyan
-	searchIcon: "2",       // dim
-	placeholder: "2;3",    // dim italic
-	description: "2",      // dim
-	hint: "2",             // dim
-	changed: "33",         // yellow
-	duplicate: "35",       // magenta
+  border: "2", // dim
+  title: "2", // dim
+  enabled: "32", // green
+  hidden: "33", // yellow
+  disabled: "31", // red
+  selected: "36", // cyan
+  selectedText: "36", // cyan
+  searchIcon: "2", // dim
+  placeholder: "2;3", // dim italic
+  description: "2", // dim
+  hint: "2", // dim
+  changed: "33", // yellow
+  duplicate: "35", // magenta
 };
 
 function loadTheme(): ToggleTheme {
-	const configPath = path.join(os.homedir(), ".pi", "agent", "extensions", "skill-toggle", "theme.json");
-	try {
-		if (fs.existsSync(configPath)) {
-			const content = fs.readFileSync(configPath, "utf-8");
-			const custom = JSON.parse(content) as Partial<ToggleTheme>;
-			return { ...DEFAULT_THEME, ...custom };
-		}
-	} catch {
-		// Ignore errors, use default
-	}
-	return DEFAULT_THEME;
+  const candidates = new Set<string>();
+
+  // A theme.json next to the extension works for git/local installs.
+  try {
+    candidates.add(path.join(path.dirname(fileURLToPath(import.meta.url)), "theme.json"));
+  } catch {
+    // Some transpilers do not expose import.meta.url; use the legacy path below.
+  }
+
+  const agentDir = getAgentDir();
+  candidates.add(path.join(agentDir, "extensions", "skill-toggle", "theme.json"));
+  candidates.add(path.join(agentDir, "extensions", "pi-skill-toggle", "theme.json"));
+
+  for (const configPath of candidates) {
+    try {
+      if (fs.existsSync(configPath)) {
+        const custom = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Partial<ToggleTheme>;
+        return { ...DEFAULT_THEME, ...custom };
+      }
+    } catch {
+      // Ignore malformed/missing theme files and keep trying other candidates.
+    }
+  }
+
+  return DEFAULT_THEME;
 }
 
 function fg(code: string, text: string): string {
-	if (!code) return text;
-	return `\x1b[${code}m${text}\x1b[0m`;
+  if (!code) return text;
+  return `\x1b[${code}m${text}\x1b[0m`;
 }
 
 const toggleTheme = loadTheme();
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Settings Management
+// Skill discovery
 // ═══════════════════════════════════════════════════════════════════════════
 
-const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
+const AGENT_DIR = getAgentDir();
 
-interface Settings {
-	skills?: string[];
-	[key: string]: unknown;
+function canonicalPath(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
 }
 
-function loadSettings(): Settings {
-	try {
-		if (fs.existsSync(SETTINGS_PATH)) {
-			return JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
-		}
-	} catch {
-		// Ignore
-	}
-	return {};
+function resolveSkillFilePath(resourcePath: string): string | undefined {
+  const resolved = path.resolve(resourcePath);
+
+  try {
+    const stats = fs.statSync(resolved);
+    if (stats.isFile() && resolved.toLowerCase().endsWith(".md")) {
+      return resolved;
+    }
+    if (stats.isDirectory()) {
+      const skillFile = path.join(resolved, "SKILL.md");
+      if (fs.statSync(skillFile).isFile()) return skillFile;
+    }
+  } catch {
+    // The package manager can retain a stale resource entry; ignore it.
+  }
+
+  return undefined;
 }
 
-function saveSettings(settings: Settings): void {
-	fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+function parseSkillFile(filePath: string): ParsedSkill | undefined {
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    const { frontmatter } = parseFrontmatter<Record<string, unknown>>(content);
+    const fallbackName = path.basename(path.dirname(filePath));
+    const name = typeof frontmatter.name === "string" && frontmatter.name.trim()
+      ? frontmatter.name.trim()
+      : fallbackName;
+    const description = typeof frontmatter.description === "string"
+      ? frontmatter.description.trim()
+      : "";
+
+    // Pi follows the Agent Skills format and treats this as a YAML boolean.
+    // Accept the string form too so older skill files remain understandable.
+    const rawDisable = frontmatter["disable-model-invocation"];
+    const disableModelInvocation = rawDisable === true ||
+      (typeof rawDisable === "string" && rawDisable.toLowerCase() === "true");
+
+    if (!description) return undefined;
+    return { name, description, disableModelInvocation };
+  } catch {
+    return undefined;
+  }
 }
 
-// The base directories for skills - used to compute relative paths
-const AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
-const PROJECT_DIR = process.cwd();
-
-/**
- * Get the set of disabled skill paths from settings.
- * Skills are disabled using the -path pattern.
- * Returns normalized absolute paths for both the directory and SKILL.md file.
- */
-function getDisabledSkillPaths(settings: Settings): Set<string> {
-	const disabled = new Set<string>();
-	const skills = settings.skills ?? [];
-	for (const entry of skills) {
-		if (typeof entry === "string" && entry.startsWith("-")) {
-			// Remove the - prefix and resolve to absolute path
-			const rawPath = entry.slice(1);
-			const absolutePath = normalizeSettingsPath(rawPath);
-			disabled.add(absolutePath);
-			// Also add SKILL.md if this is a directory
-			const skillMd = path.join(absolutePath, "SKILL.md");
-			disabled.add(skillMd);
-		}
-	}
-	return disabled;
-}
-
-/**
- * Check if a skill file path is disabled
- */
-function isSkillDisabled(filePath: string, disabledPaths: Set<string>): boolean {
-	const normalized = path.normalize(filePath);
-	const dir = path.dirname(filePath);
-	return disabledPaths.has(normalized) || disabledPaths.has(dir);
-}
-
-/**
- * Get the relative path for a skill, suitable for use in settings.json.
- * Pi's resource filtering uses relative paths from the baseDir (~/.pi/agent or .pi).
- */
-function getSkillRelativePath(skillFilePath: string): { path: string; isRelative: boolean } {
-	const skillDir = path.dirname(skillFilePath);
-	
-	// Check if under ~/.pi/agent/
-	if (skillDir.startsWith(AGENT_DIR + path.sep) || skillDir === AGENT_DIR) {
-		const rel = path.relative(AGENT_DIR, skillDir);
-		return { path: rel, isRelative: true };
-	}
-	
-	// Check if under current project's .pi/
-	const projectPiDir = path.join(PROJECT_DIR, ".pi");
-	if (skillDir.startsWith(projectPiDir + path.sep) || skillDir === projectPiDir) {
-		const rel = path.relative(projectPiDir, skillDir);
-		return { path: rel, isRelative: true };
-	}
-	
-	// Fall back to absolute path for skills outside standard locations
-	return { path: skillDir, isRelative: false };
+function metadataForLoadedSkill(skill: Skill): ResourceMetadata {
+  return {
+    source: skill.sourceInfo.source,
+    scope: skill.sourceInfo.scope,
+    origin: skill.sourceInfo.origin,
+    // Top-level skills from an explicit extension path should be persisted
+    // using the normal Pi scope base, not the skill's own directory.
+    baseDir: skill.sourceInfo.origin === "package" ? skill.sourceInfo.baseDir : undefined,
+  };
 }
 
 /**
- * Normalize a settings entry path for comparison.
+ * Use Pi's own package/resource resolver instead of maintaining a second list
+ * of skill locations. This includes project/.agents ancestors, package skills,
+ * local settings paths, and disabled resources, and preserves Pi precedence.
+ * Missing packages are skipped so opening this UI never installs anything.
  */
-function normalizeSettingsPath(entryPath: string): string {
-	if (path.isAbsolute(entryPath)) {
-		return path.normalize(entryPath);
-	}
-	
-	if (entryPath.startsWith("~")) {
-		return normalizePath(entryPath);
-	}
-	
-	return path.join(AGENT_DIR, entryPath);
-}
+async function loadAllSkills(ctx: ExtensionCommandContext): Promise<SkillCatalog> {
+  const settingsManager = SettingsManager.create(ctx.cwd, AGENT_DIR, {
+    projectTrusted: ctx.isProjectTrusted(),
+  });
+  const resources: SkillResource[] = [];
+  const resourceByPath = new Map<string, SkillResource>();
 
-/**
- * Update settings to reflect enabled/disabled state changes.
- * When disabling a skill with duplicates, disables ALL paths.
- */
-function applyChanges(changes: Map<string, DisableMode>, skillsByName: Map<string, SkillInfo>): void {
-	const settings = loadSettings();
-	const skills = settings.skills ?? [];
-	const newSkills: string[] = [];
-	
-	// Collect paths that need settings.json changes
-	const pathsToDisable = new Set<string>();  // Add -path
-	const pathsToUndisable = new Set<string>(); // Remove -path
-	
-	// Collect skills that need frontmatter changes
-	const skillsToHide: SkillInfo[] = [];     // Add disable-model-invocation: true
-	const skillsToUnhide: SkillInfo[] = [];   // Remove disable-model-invocation
-	
-	for (const [skillName, newMode] of changes) {
-		const skill = skillsByName.get(skillName);
-		if (!skill) continue;
-		
-		// Determine what changes are needed
-		if (newMode === "disabled") {
-			// Add -path to settings.json (leave frontmatter alone)
-			for (const filePath of skill.allPaths) {
-				pathsToDisable.add(filePath);
-			}
-		} else if (newMode === "hidden") {
-			// Remove -path from settings.json, add disable-model-invocation to frontmatter
-			for (const filePath of skill.allPaths) {
-				pathsToUndisable.add(filePath);
-			}
-			skillsToHide.push(skill);
-		} else {
-			// enabled: Remove -path from settings.json, remove disable-model-invocation from frontmatter
-			for (const filePath of skill.allPaths) {
-				pathsToUndisable.add(filePath);
-			}
-			skillsToUnhide.push(skill);
-		}
-	}
-	
-	// Helper to check if a settings entry matches any of the paths
-	const matchesPath = (entry: string, targetPaths: Set<string>): boolean => {
-		if (!entry.startsWith("-")) return false;
-		const entryPath = normalizeSettingsPath(entry.slice(1));
-		for (const filePath of targetPaths) {
-			const skillDir = path.dirname(filePath);
-			if (entryPath === skillDir || entryPath === filePath) {
-				return true;
-			}
-		}
-		return false;
-	};
-	
-	// Keep non-disable entries and entries not being un-disabled
-	for (const entry of skills) {
-		if (typeof entry !== "string") {
-			newSkills.push(entry);
-			continue;
-		}
-		
-		if (!entry.startsWith("-")) {
-			newSkills.push(entry);
-			continue;
-		}
-		
-		// This is a disable entry - check if it's being removed
-		if (matchesPath(entry, pathsToUndisable)) {
-			// Skip it (remove from settings)
-			continue;
-		}
-		
-		// Keep it
-		newSkills.push(entry);
-	}
-	
-	// Add new disable entries
-	const existingDisables = new Set(
-		newSkills
-			.filter(s => typeof s === "string" && s.startsWith("-"))
-			.map(s => normalizeSettingsPath((s as string).slice(1)))
-	);
-	
-	for (const filePath of pathsToDisable) {
-		const skillDir = path.dirname(filePath);
-		if (existingDisables.has(skillDir) || existingDisables.has(filePath)) {
-			continue; // Already disabled
-		}
-		
-		const { path: skillPath } = getSkillRelativePath(filePath);
-		newSkills.push(`-${skillPath}`);
-	}
-	
-	settings.skills = newSkills;
-	saveSettings(settings);
-	
-	// Update frontmatter for hidden skills
-	for (const skill of skillsToHide) {
-		try {
-			updateSkillFrontmatter(skill.filePath, true);
-		} catch (error) {
-			// Log but continue - don't fail the whole operation
-			console.error(`Failed to update frontmatter for ${skill.name}: ${error}`);
-		}
-	}
-	
-	// Update frontmatter for un-hidden skills
-	for (const skill of skillsToUnhide) {
-		try {
-			updateSkillFrontmatter(skill.filePath, false);
-		} catch (error) {
-			console.error(`Failed to update frontmatter for ${skill.name}: ${error}`);
-		}
-	}
-}
+  const addResource = (
+    resourcePath: string,
+    enabled: boolean,
+    metadata: ResourceMetadata,
+  ): void => {
+    const filePath = resolveSkillFilePath(resourcePath);
+    if (!filePath) return;
 
-function normalizePath(p: string): string {
-	const trimmed = p.trim();
-	if (trimmed === "~") return os.homedir();
-	if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
-	if (trimmed.startsWith("~")) return path.join(os.homedir(), trimmed.slice(1));
-	return path.resolve(trimmed);
+    const parsed = parseSkillFile(filePath);
+    if (!parsed) return;
+
+    const key = canonicalPath(filePath);
+    const existing = resourceByPath.get(key);
+    if (existing) {
+      // A skill supplied by an explicit path is active even if the same path
+      // also appeared in a stale/disabled resolver entry.
+      existing.enabled = existing.enabled || enabled;
+      return;
+    }
+
+    const entry: SkillResource = { filePath, enabled, metadata, parsed };
+    resources.push(entry);
+    resourceByPath.set(key, entry);
+  };
+
+
+  try {
+    const packageManager = new DefaultPackageManager({
+      cwd: ctx.cwd,
+      agentDir: AGENT_DIR,
+      settingsManager,
+    });
+    const resolved = await packageManager.resolve(async () => "skip");
+    for (const resource of resolved.skills) {
+      addResource(resource.path, resource.enabled, resource.metadata);
+    }
+  } catch (error) {
+    // Keep the command useful even when a third-party package has a broken
+    // manifest. The currently loaded skills are still available below.
+    console.error(`pi-skill-toggle: failed to resolve configured skills: ${String(error)}`);
+  }
+
+  // Include temporary/extension-provided skills that are active in this Pi
+  // session but are not represented by settings/package resolution.
+  for (const skill of ctx.getSystemPromptOptions().skills ?? []) {
+    addResource(skill.filePath, true, metadataForLoadedSkill(skill));
+  }
+
+  const byName = new Map<string, SkillInfo>();
+  for (const resource of resources) {
+    let skill = byName.get(resource.parsed.name);
+    if (!skill) {
+      skill = {
+        name: resource.parsed.name,
+        description: resource.parsed.description,
+        filePath: resource.filePath,
+        allPaths: [],
+        resources: [],
+        mode: "enabled",
+        disableModelInvocation: resource.parsed.disableModelInvocation,
+        hasDuplicates: false,
+      };
+      byName.set(resource.parsed.name, skill);
+    }
+
+    skill.resources.push(resource);
+    if (!skill.allPaths.some((p) => canonicalPath(p) === canonicalPath(resource.filePath))) {
+      skill.allPaths.push(resource.filePath);
+    }
+
+    // The first enabled resource is the same winner Pi uses after resource
+    // precedence and path deduplication have been applied.
+    if (skill.resources.filter((item) => item.enabled).length === 1 && resource.enabled) {
+      skill.filePath = resource.filePath;
+      skill.description = resource.parsed.description;
+      skill.disableModelInvocation = resource.parsed.disableModelInvocation;
+    }
+  }
+
+  for (const skill of byName.values()) {
+    skill.hasDuplicates = skill.allPaths.length > 1;
+    const enabledResources = skill.resources.filter((resource) => resource.enabled);
+    if (enabledResources.length === 0) {
+      skill.mode = "disabled";
+    } else if (enabledResources[0].parsed.disableModelInvocation) {
+      skill.mode = "hidden";
+    } else {
+      skill.mode = "enabled";
+    }
+  }
+
+  const skills = Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+  return { skills, byName, settingsManager };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Skill Discovery
+// Settings and frontmatter updates
 // ═══════════════════════════════════════════════════════════════════════════
 
-type SkillFormat = "recursive" | "claude";
-
-interface SkillDirConfig {
-	dir: string;
-	format: SkillFormat;
+function normalizePath(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
+  if (trimmed.startsWith("~")) return path.join(os.homedir(), trimmed.slice(1));
+  return path.resolve(trimmed);
 }
 
-interface RawSkill {
-	name: string;
-	description: string;
-	filePath: string;
-	realPath: string;
-	disableModelInvocation: boolean;
+function resolveSettingsPath(value: string, baseDir: string): string {
+  if (path.isAbsolute(value)) return path.normalize(value);
+  if (value.startsWith("~")) return normalizePath(value);
+  return path.resolve(baseDir, value);
 }
 
-/**
- * Scan a directory for skills (raw, before deduplication)
- */
-function scanSkillDir(
-	dir: string,
-	format: SkillFormat,
-	skills: RawSkill[],
-	visitedRealPaths: Set<string>,
-	visitedDirs?: Set<string>
-): void {
-	if (!fs.existsSync(dir)) return;
-
-	const visited = visitedDirs ?? new Set<string>();
-	let realDir: string;
-	try {
-		realDir = fs.realpathSync(dir);
-	} catch {
-		realDir = dir;
-	}
-	if (visited.has(realDir)) return;
-	visited.add(realDir);
-
-	try {
-		const entries = fs.readdirSync(dir, { withFileTypes: true });
-		for (const entry of entries) {
-			if (entry.name.startsWith(".")) continue;
-			if (entry.name === "node_modules") continue;
-
-			const entryPath = path.join(dir, entry.name);
-
-			let isDirectory = entry.isDirectory();
-			let isFile = entry.isFile();
-			if (entry.isSymbolicLink()) {
-				try {
-					const stats = fs.statSync(entryPath);
-					isDirectory = stats.isDirectory();
-					isFile = stats.isFile();
-				} catch {
-					continue;
-				}
-			}
-
-			if (format === "recursive") {
-				if (isDirectory) {
-					scanSkillDir(entryPath, format, skills, visitedRealPaths, visited);
-				} else if (isFile && entry.name === "SKILL.md") {
-					loadRawSkill(entryPath, skills, visitedRealPaths);
-				}
-			} else if (format === "claude") {
-				if (!isDirectory) continue;
-				const skillFile = path.join(entryPath, "SKILL.md");
-				if (!fs.existsSync(skillFile)) continue;
-				loadRawSkill(skillFile, skills, visitedRealPaths);
-			}
-		}
-	} catch {
-		// Skip inaccessible directories
-	}
+function settingsBaseDir(scope: SettingsScope, cwd: string): string {
+  return scope === "global" ? AGENT_DIR : path.join(cwd, CONFIG_DIR_NAME);
 }
 
-function loadRawSkill(filePath: string, skills: RawSkill[], visitedRealPaths: Set<string>): void {
-	try {
-		// Resolve symlinks to detect same file
-		let realPath: string;
-		try {
-			realPath = fs.realpathSync(filePath);
-		} catch {
-			realPath = filePath;
-		}
-		
-		// Skip if we've already loaded this exact file (via symlink)
-		if (visitedRealPaths.has(realPath)) {
-			return;
-		}
-		visitedRealPaths.add(realPath);
-		
-		const content = fs.readFileSync(filePath, "utf-8");
-		const skillDir = path.dirname(filePath);
-		const parentDirName = path.basename(skillDir);
-		const { name, description, disableModelInvocation } = parseFrontmatter(content, parentDirName);
-		
-		if (!description) return;
-		
-		skills.push({
-			name,
-			description,
-			filePath,
-			realPath,
-			disableModelInvocation,
-		});
-	} catch {
-		// Skip invalid skill files
-	}
+function resourceSettingsScope(resource: SkillResource): SettingsScope | undefined {
+  if (resource.metadata.origin === "package") return undefined;
+  if (resource.metadata.scope === "user") return "global";
+  if (resource.metadata.scope === "project") return "project";
+  return undefined;
 }
 
-function parseFrontmatter(content: string, fallbackName: string): { name: string; description: string; disableModelInvocation: boolean } {
-	if (!content.startsWith("---")) {
-		return { name: fallbackName, description: "", disableModelInvocation: false };
-	}
-
-	const endIndex = content.indexOf("\n---", 3);
-	if (endIndex === -1) {
-		return { name: fallbackName, description: "", disableModelInvocation: false };
-	}
-
-	const frontmatter = content.slice(4, endIndex);
-	let name = fallbackName;
-	let description = "";
-	let disableModelInvocation = false;
-
-	for (const line of frontmatter.split("\n")) {
-		const colonIndex = line.indexOf(":");
-		if (colonIndex === -1) continue;
-
-		const key = line.slice(0, colonIndex).trim();
-		const value = line.slice(colonIndex + 1).trim();
-
-		if (key === "name") name = value;
-		if (key === "description") description = value;
-		if (key === "disable-model-invocation") {
-			disableModelInvocation = value.toLowerCase() === "true";
-		}
-	}
-
-	return { name, description, disableModelInvocation };
+function resourcePatternBaseDir(resource: SkillResource, scope: SettingsScope, cwd: string): string {
+  return resource.metadata.baseDir
+    ? path.resolve(resource.metadata.baseDir)
+    : settingsBaseDir(scope, cwd);
 }
 
-/**
- * Set or update a frontmatter field in a SKILL.md file.
- * Creates frontmatter block if it doesn't exist.
- */
-function setFrontmatterField(content: string, key: string, value: string): string {
-	if (!content.startsWith("---")) {
-		// No frontmatter, add it
-		return `---\n${key}: ${value}\n---\n${content}`;
-	}
-
-	const endIndex = content.indexOf("\n---", 3);
-	if (endIndex === -1) {
-		// Malformed frontmatter, add key at start
-		return `---\n${key}: ${value}\n---\n${content}`;
-	}
-
-	const frontmatter = content.slice(4, endIndex);
-	const rest = content.slice(endIndex + 4);
-	const lines = frontmatter.split("\n");
-	
-	// Check if key already exists
-	let found = false;
-	for (let i = 0; i < lines.length; i++) {
-		const colonIndex = lines[i].indexOf(":");
-		if (colonIndex === -1) continue;
-		const lineKey = lines[i].slice(0, colonIndex).trim();
-		if (lineKey === key) {
-			lines[i] = `${key}: ${value}`;
-			found = true;
-			break;
-		}
-	}
-	
-	if (!found) {
-		lines.push(`${key}: ${value}`);
-	}
-	
-	return `---\n${lines.join("\n")}\n---${rest}`;
+function resourceFilterPath(resource: SkillResource): string {
+  return path.basename(resource.filePath) === "SKILL.md"
+    ? path.dirname(resource.filePath)
+    : resource.filePath;
 }
 
-/**
- * Remove a frontmatter field from a SKILL.md file.
- */
-function removeFrontmatterField(content: string, key: string): string {
-	if (!content.startsWith("---")) {
-		return content; // No frontmatter
-	}
+function resourceSettingsPattern(resource: SkillResource, scope: SettingsScope, cwd: string): string {
+  const filterPath = resourceFilterPath(resource);
+  const relative = path.relative(resourcePatternBaseDir(resource, scope, cwd), filterPath);
 
-	const endIndex = content.indexOf("\n---", 3);
-	if (endIndex === -1) {
-		return content; // Malformed
-	}
-
-	const frontmatter = content.slice(4, endIndex);
-	const rest = content.slice(endIndex + 4);
-	const lines = frontmatter.split("\n");
-	
-	const filteredLines = lines.filter(line => {
-		const colonIndex = line.indexOf(":");
-		if (colonIndex === -1) return true;
-		const lineKey = line.slice(0, colonIndex).trim();
-		return lineKey !== key;
-	});
-	
-	// If frontmatter is now empty, we could remove it, but safer to keep structure
-	return `---\n${filteredLines.join("\n")}\n---${rest}`;
+  if (relative && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)) {
+    return relative.split(path.sep).join("/");
+  }
+  return filterPath;
 }
 
-/**
- * Update a SKILL.md file's disable-model-invocation field.
- * Creates backup before modifying.
- */
+function entryTargetsSkill(entry: string, prefix: "-" | "+", resource: SkillResource, scope: SettingsScope, cwd: string): boolean {
+  if (!entry.startsWith(prefix)) return false;
+  const target = resolveSettingsPath(entry.slice(1), resourcePatternBaseDir(resource, scope, cwd));
+  return target === resource.filePath || target === path.dirname(resource.filePath);
+}
+
+
+function updateSkillPathSettings(
+  settings: PiSettings,
+  scope: SettingsScope,
+  resources: SkillResource[],
+  desiredEnabled: boolean,
+  cwd: string,
+): boolean {
+  const current = Array.isArray(settings.skills) ? [...settings.skills] : [];
+  let next = current;
+  let changed = false;
+
+  for (const resource of resources) {
+    const pattern = resourceSettingsPattern(resource, scope, cwd);
+    const disableEntry = `-${pattern}`;
+    const enableEntry = `+${pattern}`;
+
+    if (!desiredEnabled) {
+      const withoutExactIncludes = next.filter((entry) =>
+        typeof entry !== "string" || !entryTargetsSkill(entry, "+", resource, scope, cwd));
+      changed = changed || withoutExactIncludes.length !== next.length;
+      next = withoutExactIncludes;
+
+      const alreadyDisabled = next.some((entry) =>
+        typeof entry === "string" && entryTargetsSkill(entry, "-", resource, scope, cwd));
+      if (!alreadyDisabled) {
+        next.push(disableEntry);
+        changed = true;
+      }
+      continue;
+    }
+
+    const withoutExactDisables = next.filter((entry) =>
+      typeof entry !== "string" || !entryTargetsSkill(entry, "-", resource, scope, cwd));
+    changed = changed || withoutExactDisables.length !== next.length;
+    next = withoutExactDisables;
+
+    // `!pattern` exclusions can still disable a skill after an exact `-path`
+    // is removed. A `+path` is Pi's supported force-include escape hatch.
+    if (!resource.enabled && !next.some((entry) =>
+      typeof entry === "string" && entry === enableEntry)) {
+      next.push(enableEntry);
+      changed = true;
+    }
+  }
+
+  if (changed) settings.skills = next;
+  return changed;
+}
+
+function packageSkillPattern(resource: SkillResource): string | undefined {
+  const baseDir = resource.metadata.baseDir;
+  if (!baseDir) return undefined;
+  const relative = path.relative(baseDir, resourceFilterPath(resource));
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+  return relative.split(path.sep).join("/");
+}
+
+function packageSource(entry: PackageSource): string {
+  return typeof entry === "string" ? entry : entry.source;
+}
+
+function packagePatternTargetsSkill(pattern: string, relativeSkillDir: string): boolean {
+  if (!pattern.startsWith("-") && !pattern.startsWith("+")) return false;
+  const target = pattern.slice(1).replace(/\/$/, "");
+  return target === relativeSkillDir || target === `${relativeSkillDir}/SKILL.md`;
+}
+
+function updatePackageSkillSettings(
+  packages: PackageSource[],
+  resource: SkillResource,
+  desiredEnabled: boolean,
+): boolean {
+  const relativeSkillDir = packageSkillPattern(resource);
+  if (!relativeSkillDir) return false;
+
+  const source = resource.metadata.source;
+  const index = packages.findIndex((entry) => packageSource(entry) === source);
+  if (index === -1) return false;
+
+  const existing = packages[index];
+  if (!desiredEnabled) {
+    const pattern = `-${relativeSkillDir}`;
+    if (typeof existing === "string") {
+      packages[index] = { source: existing, skills: [pattern] };
+      return true;
+    }
+
+    const skills = [...(existing.skills ?? [])];
+    // An empty package filter explicitly disables every skill; adding a
+    // negative pattern would accidentally re-enable the other skills.
+    if (skills.length === 0) return false;
+    if (skills.some((item) => item === pattern || packagePatternTargetsSkill(item, relativeSkillDir) && item.startsWith("-"))) {
+      return false;
+    }
+    packages[index] = { ...existing, skills: [...skills, pattern] };
+    return true;
+  }
+
+  if (typeof existing === "string" || existing.skills === undefined) return false;
+
+  const skills = existing.skills;
+  if (skills.length === 0) {
+    packages[index] = { ...existing, skills: [`!*`, `+${relativeSkillDir}`] };
+    return true;
+  }
+
+  const filtered = skills.filter((item) =>
+    !(item.startsWith("-") && packagePatternTargetsSkill(item, relativeSkillDir)));
+  const wasChanged = filtered.length !== skills.length;
+  const needsForceInclude = !resource.enabled && !filtered.includes(`+${relativeSkillDir}`);
+  if (needsForceInclude) filtered.push(`+${relativeSkillDir}`);
+  if (!wasChanged && !needsForceInclude) return false;
+
+  // If this object only contained the plugin's exact exclusion, returning to
+  // string form restores Pi's normal "load all package resources" behavior.
+  const onlySourceAndSkills = Object.keys(existing).every((key) => key === "source" || key === "skills");
+  if (filtered.length === 0 && onlySourceAndSkills && existing.autoload === undefined) {
+    packages[index] = existing.source;
+  } else {
+    packages[index] = filtered.length > 0 ? { ...existing, skills: filtered } : (() => {
+      const { skills: _skills, ...rest } = existing;
+      return rest;
+    })();
+  }
+  return true;
+}
+
 function updateSkillFrontmatter(filePath: string, disableModelInvocation: boolean): void {
-	const content = fs.readFileSync(filePath, "utf-8");
-	
-	// Create backup
-	const backupPath = filePath + ".bak";
-	fs.writeFileSync(backupPath, content);
-	
-	let newContent: string;
-	if (disableModelInvocation) {
-		newContent = setFrontmatterField(content, "disable-model-invocation", "true");
-	} else {
-		newContent = removeFrontmatterField(content, "disable-model-invocation");
-	}
-	
-	fs.writeFileSync(filePath, newContent);
-	
-	// Remove backup on success
-	try {
-		fs.unlinkSync(backupPath);
-	} catch {
-		// Ignore
-	}
+  const original = fs.readFileSync(filePath, "utf-8");
+  const newline = original.includes("\r\n") ? "\r\n" : "\n";
+  const lines = original.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const hasFrontmatter = lines[0] === "---";
+  let closingIndex = -1;
+  if (hasFrontmatter) {
+    closingIndex = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
+  }
+
+  let nextLines = lines;
+  if (!hasFrontmatter || closingIndex === -1) {
+    if (!disableModelInvocation) return;
+    nextLines = ["---", "disable-model-invocation: true", "---", ...lines];
+  } else {
+    const field = /^\s*disable-model-invocation\s*:/;
+    const fieldIndex = lines.findIndex((line, index) => index > 0 && index < closingIndex && field.test(line));
+    if (disableModelInvocation) {
+      nextLines = [...lines];
+      if (fieldIndex === -1) {
+        nextLines.splice(closingIndex, 0, "disable-model-invocation: true");
+      } else {
+        nextLines[fieldIndex] = "disable-model-invocation: true";
+      }
+    } else {
+      nextLines = lines.filter((line, index) => index !== fieldIndex);
+    }
+  }
+
+  const next = nextLines.join(newline);
+  if (next === original) return;
+
+  // Keep the old backup behavior for recoverability, but write atomically so a
+  // cancelled/failed process cannot leave a truncated SKILL.md behind.
+  const backupPath = `${filePath}.bak`;
+  const tempPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(backupPath, original, "utf-8");
+  try {
+    fs.writeFileSync(tempPath, next, "utf-8");
+    fs.renameSync(tempPath, filePath);
+    fs.unlinkSync(backupPath);
+  } catch (error) {
+    try { fs.unlinkSync(tempPath); } catch { /* ignore cleanup failure */ }
+    throw error;
+  }
 }
 
-/**
- * Load all skills from known directories, deduplicating by name (matching pi's behavior)
- */
-function loadAllSkills(): { skills: SkillInfo[]; byName: Map<string, SkillInfo> } {
-	const settings = loadSettings();
-	const disabledPaths = getDisabledSkillPaths(settings);
-	const rawSkills: RawSkill[] = [];
-	const visitedRealPaths = new Set<string>();
-	
-	const skillDirs: SkillDirConfig[] = [
-		{ dir: path.join(os.homedir(), ".codex", "skills"), format: "recursive" },
-		{ dir: path.join(os.homedir(), ".claude", "skills"), format: "claude" },
-		{ dir: path.join(process.cwd(), ".claude", "skills"), format: "claude" },
-		{ dir: path.join(os.homedir(), ".pi", "agent", "skills"), format: "recursive" },
-		{ dir: path.join(os.homedir(), ".pi", "skills"), format: "recursive" },
-		{ dir: path.join(process.cwd(), ".pi", "skills"), format: "recursive" },
-		{ dir: path.join(os.homedir(), ".agents", "skills"), format: "recursive" },
-	];
+function settingsForScope(settingsManager: SettingsManager, scope: SettingsScope): PiSettings {
+  return scope === "global"
+    ? settingsManager.getGlobalSettings()
+    : settingsManager.getProjectSettings();
+}
 
-	for (const { dir, format } of skillDirs) {
-		scanSkillDir(dir, format, rawSkills, visitedRealPaths);
-	}
+async function applyChanges(
+  changes: Map<string, DisableMode>,
+  skillsByName: Map<string, SkillInfo>,
+  ctx: ExtensionCommandContext,
+  settingsManager: SettingsManager,
+): Promise<void> {
+  const globalSettings = settingsForScope(settingsManager, "global");
+  const projectSettings = settingsForScope(settingsManager, "project");
+  const globalPackages = [...(globalSettings.packages ?? [])];
+  const projectPackages = [...(projectSettings.packages ?? [])];
+  const settingsChanged = new Map<SettingsScope, boolean>([
+    ["global", false],
+    ["project", false],
+  ]);
+  let globalPackagesChanged = false;
+  let projectPackagesChanged = false;
 
-	// Group by name, first occurrence wins (matches pi's behavior)
-	const byName = new Map<string, SkillInfo>();
-	const pathsByName = new Map<string, string[]>();
-	
-	for (const raw of rawSkills) {
-		if (!pathsByName.has(raw.name)) {
-			pathsByName.set(raw.name, []);
-		}
-		pathsByName.get(raw.name)!.push(raw.filePath);
-		
-		// First occurrence wins
-		if (!byName.has(raw.name)) {
-			byName.set(raw.name, {
-				name: raw.name,
-				description: raw.description,
-				filePath: raw.filePath,
-				allPaths: [], // Will be filled after grouping
-				mode: "enabled", // Will be computed after grouping
-				disableModelInvocation: raw.disableModelInvocation,
-				hasDuplicates: false, // Will be computed after grouping
-			});
-		}
-	}
-	
-	// Now fill in allPaths and compute mode
-	for (const [name, skill] of byName) {
-		const allPaths = pathsByName.get(name) ?? [skill.filePath];
-		skill.allPaths = allPaths;
-		skill.hasDuplicates = allPaths.length > 1;
-		
-		// Compute mode: disabled > hidden > enabled
-		const isDisabled = allPaths.every(p => isSkillDisabled(p, disabledPaths));
-		if (isDisabled) {
-			skill.mode = "disabled";
-		} else if (skill.disableModelInvocation) {
-			skill.mode = "hidden";
-		} else {
-			skill.mode = "enabled";
-		}
-	}
+  for (const [skillName, newMode] of changes) {
+    const skill = skillsByName.get(skillName);
+    if (!skill) continue;
 
-	const skills = Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
-	return { skills, byName };
+    const desiredEnabled = newMode !== "disabled";
+    const resourcesByScope = new Map<SettingsScope, SkillResource[]>([
+      ["global", []],
+      ["project", []],
+    ]);
+
+    for (const resource of skill.resources) {
+      if (resource.metadata.origin === "package") {
+        const packages = resource.metadata.scope === "project" ? projectPackages : globalPackages;
+        const changed = updatePackageSkillSettings(packages, resource, desiredEnabled);
+        if (resource.metadata.scope === "project") projectPackagesChanged ||= changed;
+        else globalPackagesChanged ||= changed;
+        continue;
+      }
+
+      const scope = resourceSettingsScope(resource);
+      if (scope) resourcesByScope.get(scope)!.push(resource);
+    }
+
+    for (const scope of ["global", "project"] as const) {
+      const scopedResources = resourcesByScope.get(scope)!;
+      if (scopedResources.length === 0) continue;
+      const settings = scope === "global" ? globalSettings : projectSettings;
+      const changed = updateSkillPathSettings(settings, scope, scopedResources, desiredEnabled, ctx.cwd);
+      settingsChanged.set(scope, settingsChanged.get(scope)! || changed);
+    }
+
+    for (const filePath of skill.allPaths) {
+      updateSkillFrontmatter(filePath, newMode === "hidden");
+    }
+  }
+
+  if (settingsChanged.get("global")) {
+    settingsManager.setSkillPaths(globalSettings.skills ?? []);
+  }
+  if (settingsChanged.get("project")) {
+    settingsManager.setProjectSkillPaths(projectSettings.skills ?? []);
+  }
+  if (globalPackagesChanged) settingsManager.setPackages(globalPackages);
+  if (projectPackagesChanged) settingsManager.setProjectPackages(projectPackages);
+
+  await settingsManager.flush();
+  const errors = settingsManager.drainErrors();
+  if (errors.length > 0) {
+    throw new Error(errors.map((item) => `${item.scope}: ${item.error.message}`).join("; "));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -692,14 +685,15 @@ class SkillToggleComponent {
 	private inactivityTimeout: ReturnType<typeof setTimeout> | null = null;
 	private static readonly INACTIVITY_MS = 120000; // 2 minutes
 
-	constructor(
-		skills: SkillInfo[],
-		private done: (result: SkillToggleResult) => void
-	) {
-		this.allSkills = skills;
-		this.filtered = skills;
-		this.resetInactivityTimeout();
-	}
+  constructor(
+    skills: SkillInfo[],
+    private done: (result: SkillToggleResult) => void,
+    private requestRender: () => void = () => {},
+  ) {
+    this.allSkills = skills;
+    this.filtered = skills;
+    this.resetInactivityTimeout();
+  }
 
 	private resetInactivityTimeout(): void {
 		if (this.inactivityTimeout) clearTimeout(this.inactivityTimeout);
@@ -716,87 +710,92 @@ class SkillToggleComponent {
 		return skill.mode;
 	}
 
-	handleInput(data: string): void {
-		this.resetInactivityTimeout();
+  handleInput(data: string): void {
+    this.resetInactivityTimeout();
 
-		if (matchesKey(data, "escape")) {
-			this.cleanup();
-			this.done({ action: "cancel", changes: new Map() });
-			return;
-		}
+    if (matchesKey(data, "escape")) {
+      this.cleanup();
+      this.done({ action: "cancel", changes: new Map() });
+      return;
+    }
 
-		// Enter/Space toggles between enabled <-> hidden (default action)
-		if (matchesKey(data, "return") || data === " ") {
-			const skill = this.filtered[this.selected];
-			if (skill) {
-				const currentMode = this.getEffectiveMode(skill);
-				const originalMode = skill.mode;
-				// Toggle: enabled <-> hidden, disabled -> enabled
-				const newMode: DisableMode = currentMode === "enabled" ? "hidden" : "enabled";
-				
-				// If toggling back to original state, remove from changes
-				if (newMode === originalMode) {
-					this.changes.delete(skill.name);
-				} else {
-					this.changes.set(skill.name, newMode);
-				}
-			}
-			return;
-		}
+    // Enter/Space toggles between enabled <-> hidden (default action).
+    if (matchesKey(data, "enter") || data === " ") {
+      const skill = this.filtered[this.selected];
+      if (skill) {
+        const currentMode = this.getEffectiveMode(skill);
+        const originalMode = skill.mode;
+        const newMode: DisableMode = currentMode === "enabled" ? "hidden" : "enabled";
 
-		// 'd' or Ctrl+D toggles full disable (enabled/hidden <-> disabled)
-		if (data === "d" || matchesKey(data, "ctrl+d")) {
-			const skill = this.filtered[this.selected];
-			if (skill) {
-				const currentMode = this.getEffectiveMode(skill);
-				const originalMode = skill.mode;
-				// Toggle: disabled <-> enabled
-				const newMode: DisableMode = currentMode === "disabled" ? "enabled" : "disabled";
-				
-				if (newMode === originalMode) {
-					this.changes.delete(skill.name);
-				} else {
-					this.changes.set(skill.name, newMode);
-				}
-			}
-			return;
-		}
+        if (newMode === originalMode) {
+          this.changes.delete(skill.name);
+        } else {
+          this.changes.set(skill.name, newMode);
+        }
+        this.requestRender();
+      }
+      return;
+    }
 
-		// Ctrl+S to save and exit
-		if (matchesKey(data, "ctrl+s")) {
-			this.cleanup();
-			this.done({ action: "apply", changes: this.changes });
-			return;
-		}
+    // 'd' or Ctrl+D toggles full disable (enabled/hidden <-> disabled).
+    const printable = decodeKittyPrintable(data) ?? data;
+    if (printable === "d" || matchesKey(data, "ctrl+d")) {
+      const skill = this.filtered[this.selected];
+      if (skill) {
+        const currentMode = this.getEffectiveMode(skill);
+        const originalMode = skill.mode;
+        const newMode: DisableMode = currentMode === "disabled" ? "enabled" : "disabled";
 
-		if (matchesKey(data, "up")) {
-			if (this.filtered.length > 0) {
-				this.selected = this.selected === 0 ? this.filtered.length - 1 : this.selected - 1;
-			}
-			return;
-		}
+        if (newMode === originalMode) {
+          this.changes.delete(skill.name);
+        } else {
+          this.changes.set(skill.name, newMode);
+        }
+        this.requestRender();
+      }
+      return;
+    }
 
-		if (matchesKey(data, "down")) {
-			if (this.filtered.length > 0) {
-				this.selected = this.selected === this.filtered.length - 1 ? 0 : this.selected + 1;
-			}
-			return;
-		}
+    // Ctrl+S to save and exit.
+    if (matchesKey(data, "ctrl+s")) {
+      this.cleanup();
+      this.done({ action: "apply", changes: this.changes });
+      return;
+    }
 
-		if (matchesKey(data, "backspace")) {
-			if (this.query.length > 0) {
-				this.query = this.query.slice(0, -1);
-				this.updateFilter();
-			}
-			return;
-		}
+    if (matchesKey(data, "up")) {
+      if (this.filtered.length > 0) {
+        this.selected = this.selected === 0 ? this.filtered.length - 1 : this.selected - 1;
+        this.requestRender();
+      }
+      return;
+    }
 
-		// Printable character
-		if (data.length === 1 && data.charCodeAt(0) >= 32) {
-			this.query += data;
-			this.updateFilter();
-		}
-	}
+    if (matchesKey(data, "down")) {
+      if (this.filtered.length > 0) {
+        this.selected = this.selected === this.filtered.length - 1 ? 0 : this.selected + 1;
+        this.requestRender();
+      }
+      return;
+    }
+
+    if (matchesKey(data, "backspace")) {
+      if (this.query.length > 0) {
+        this.query = this.query.slice(0, -1);
+        this.updateFilter();
+        this.requestRender();
+      }
+      return;
+    }
+
+    // Printable characters. decodeKittyPrintable also handles Kitty keyboard
+    // protocol sequences used by current Pi/TUI versions.
+    if (printable.length === 1 && printable.charCodeAt(0) >= 32) {
+      this.query += printable;
+      this.updateFilter();
+      this.requestRender();
+    }
+  }
 
 	private updateFilter(): void {
 		this.filtered = filterSkills(this.allSkills, this.query);
@@ -804,7 +803,7 @@ class SkillToggleComponent {
 	}
 
 	render(width: number): string[] {
-		const innerW = width - 2;
+    const innerW = Math.max(1, width - 2);
 		const lines: string[] = [];
 
 		const t = toggleTheme;
@@ -833,14 +832,14 @@ class SkillToggleComponent {
 		const enabledCount = this.allSkills.filter(s => this.getEffectiveMode(s) === "enabled").length;
 		const hiddenCount = this.allSkills.filter(s => this.getEffectiveMode(s) === "hidden").length;
 		const disabledCount = this.allSkills.filter(s => this.getEffectiveMode(s) === "disabled").length;
-		const totalCount = this.allSkills.length;
 
-		// Top border with title
-		const titleText = ` Skills (${enabledCount} on, ${hiddenCount} hidden, ${disabledCount} off) `;
-		const borderLen = innerW - visLen(titleText);
-		const leftBorder = Math.floor(borderLen / 2);
-		const rightBorder = borderLen - leftBorder;
-		lines.push(border("╭" + "─".repeat(leftBorder)) + title(titleText) + border("─".repeat(rightBorder) + "╮"));
+    // Top border with title. Keep the component valid on narrow terminals too.
+    const titleText = ` Skills (${enabledCount} on, ${hiddenCount} hidden, ${disabledCount} off) `;
+    const visibleTitle = truncateToWidth(titleText, innerW, "", true);
+    const borderLen = Math.max(0, innerW - visLen(visibleTitle));
+    const leftBorder = Math.floor(borderLen / 2);
+    const rightBorder = borderLen - leftBorder;
+    lines.push(border("╭" + "─".repeat(leftBorder)) + title(visibleTitle) + border("─".repeat(rightBorder) + "╮"));
 
 		lines.push(emptyRow());
 
@@ -946,47 +945,64 @@ class SkillToggleComponent {
 // Extension Entry Point
 // ═══════════════════════════════════════════════════════════════════════════
 
+async function openSkillToggle(_args: string, ctx: ExtensionCommandContext): Promise<void> {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("Skill toggle requires interactive TUI mode", "warning");
+    return;
+  }
+
+  let catalog: SkillCatalog;
+  try {
+    catalog = await loadAllSkills(ctx);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Failed to load skills: ${message}`, "error");
+    return;
+  }
+
+  const { skills, byName, settingsManager } = catalog;
+  if (skills.length === 0) {
+    ctx.ui.notify("No skills found", "warning");
+    return;
+  }
+
+  const result = await ctx.ui.custom<SkillToggleResult>(
+    (tui, _theme, _keybindings, done) => new SkillToggleComponent(
+      skills,
+      (value) => done(value),
+      () => tui.requestRender(),
+    ),
+    { overlay: true, overlayOptions: { anchor: "center", width: 80 } },
+  );
+
+  if (!result || result.action !== "apply" || result.changes.size === 0) return;
+
+  try {
+    await applyChanges(result.changes, byName, ctx, settingsManager);
+
+    const enabledCount = Array.from(result.changes.values()).filter((value) => value === "enabled").length;
+    const hiddenCount = Array.from(result.changes.values()).filter((value) => value === "hidden").length;
+    const disabledCount = Array.from(result.changes.values()).filter((value) => value === "disabled").length;
+
+    const parts: string[] = [];
+    if (enabledCount > 0) parts.push(`${enabledCount} enabled`);
+    if (hiddenCount > 0) parts.push(`${hiddenCount} hidden`);
+    if (disabledCount > 0) parts.push(`${disabledCount} disabled`);
+
+    ctx.ui.notify(`Skills updated: ${parts.join(", ")}. Use /reload or restart for changes to take effect.`, "info");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    ctx.ui.notify(`Failed to save settings: ${message}`, "error");
+  }
+}
+
 export default function skillToggleExtension(pi: ExtensionAPI): void {
-	// Register the /skills command
-	pi.registerCommand("skills-toggle", {
-		description: "Toggle skills on/off (changes require restart)",
-		handler: async (_args: string, ctx: ExtensionContext) => {
-			const { skills, byName } = loadAllSkills();
+  const command = {
+    description: "Toggle skills on/off (changes require /reload or restart)",
+    handler: openSkillToggle,
+  };
 
-			if (skills.length === 0) {
-				ctx.ui.notify("No skills found", "warning");
-				return;
-			}
-
-			const result = await ctx.ui.custom<SkillToggleResult>(
-				(_tui, _theme, _keybindings, done) => new SkillToggleComponent(
-					skills,
-					(r) => done(r)
-				),
-				{ overlay: true, overlayOptions: { anchor: "center", width: 80 } }
-			);
-
-			if (result.action === "apply" && result.changes.size > 0) {
-				try {
-					applyChanges(result.changes, byName);
-					
-					const enabledCount = Array.from(result.changes.values()).filter(v => v === "enabled").length;
-					const hiddenCount = Array.from(result.changes.values()).filter(v => v === "hidden").length;
-					const disabledCount = Array.from(result.changes.values()).filter(v => v === "disabled").length;
-					
-					const parts: string[] = [];
-					if (enabledCount > 0) parts.push(`${enabledCount} enabled`);
-					if (hiddenCount > 0) parts.push(`${hiddenCount} hidden`);
-					if (disabledCount > 0) parts.push(`${disabledCount} disabled`);
-					
-					ctx.ui.notify(`Skills updated: ${parts.join(", ")}. Use /reload or restart for changes to take effect.`, "success");
-				} catch (error) {
-					const msg = error instanceof Error ? error.message : "Unknown error";
-					ctx.ui.notify(`Failed to save settings: ${msg}`, "error");
-				}
-			} else if (result.action === "cancel") {
-				// Silent cancel
-			}
-		},
-	});
+  pi.registerCommand("skills-toggle", command);
+  // Keep the short command mentioned by the original extension's header.
+  pi.registerCommand("skills", command);
 }

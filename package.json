@@ -1,8 +1,9 @@
 {
   "name": "pi-skill-toggle",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Enable/disable skills from loading into pi context at startup",
   "main": "index.ts",
+  "type": "module",
   "files": [
     "index.ts",
     "theme.example.json"
@@ -20,6 +21,13 @@
     "url": "https://github.com/Whamp/pi-skill-toggle/issues"
   },
   "homepage": "https://github.com/Whamp/pi-skill-toggle#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
